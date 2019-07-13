@@ -7,6 +7,8 @@ use chrono::{DateTime, Date, Utc, NaiveDate};
 use scraper::{Html, Selector};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
+use std::io::{Result, Write};
+use std::fs::File;
 
 const BASE_URL: &str = "https://overrustlelogs.net";
 
@@ -158,6 +160,21 @@ pub fn get_all_urls_for_channel(client: &Client, channel: String) -> Vec<LogFile
     day_urls.sort_by(|l, r| l.date.cmp(&r.date));
     bar.finish();
     day_urls
+}
+
+pub fn save_file(path: &str, messages: &Vec<Message>) -> Result<()> {
+    // serialize in memory first
+    let t = std::time::Instant::now();
+    let bytes = bincode::serialize(messages).expect("Serialization failed");
+    eprintln!("Serialized into {} bytes in {:3} s", bytes.len(), t.elapsed().as_secs_f64());
+
+    // then write to file
+    let mut file = File::create(path)?;
+    let t = std::time::Instant::now();
+    let nbytes = file.write(&bytes)?;
+    eprintln!("Written {} bytes to file in {:3} s", nbytes, t.elapsed().as_secs_f64());
+
+    Ok(())
 }
 
 #[cfg(test)]

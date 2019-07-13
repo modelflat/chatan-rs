@@ -12,7 +12,7 @@ fn main() {
     println!("Getting urls...");
     let urls = overrustle::get_all_urls_for_channel(&client, "forsen".to_string());
     println!("Found urls: {}. Getting files...", urls.len());
-    let files = overrustle::fetch_files(&client, &urls[..1]);
+    let files = overrustle::fetch_files(&client, &urls);
     println!("Downloaded files. Parsing messages...");
 
     let t = time::Instant::now();
@@ -21,4 +21,10 @@ fn main() {
 
     println!("First message: {:?}", messages.first().unwrap());
     println!("Last message: {:?}", messages.last().unwrap());
+
+    println!("Saving to file...");
+
+    let t = time::Instant::now();
+    overrustle::save_file("parsed_messages_serialized.bin", &messages);
+    println!("Saving took {:3}s", t.elapsed().as_secs_f64());
 }
