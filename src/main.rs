@@ -5,26 +5,36 @@ mod chatan;
 use chatan::overrustle;
 use reqwest::Client;
 
-use std::time;
+use crate::chatan::overrustle::LocalChannelLogs;
+use std::path::PathBuf;
+use std::str::FromStr;
+use chrono::Utc;
+use chrono::offset::TimeZone;
 
 fn main() {
     let client = Client::new();
-    println!("Getting urls...");
-    let urls = overrustle::get_all_urls_for_channel(&client, "forsen".to_string());
-    println!("Found urls: {}. Getting files...", urls.len());
-    let files = overrustle::fetch_files(&client, &urls);
-    println!("Downloaded files. Parsing messages...");
 
-    let t = time::Instant::now();
-    let messages = overrustle::parse_files(&files);
-    println!("Messages parsed: {} / {:.3}s spent", messages.len(), t.elapsed().as_secs_f64());
+    let mut local_logs = LocalChannelLogs::from_path(
+        &client, "forsen".to_string(), PathBuf::from_str(".").unwrap()
+    ).unwrap();
+    local_logs.print_info();
+    local_logs.download(&client, true);
 
-    println!("First message: {:?}", messages.first().unwrap());
-    println!("Last message: {:?}", messages.last().unwrap());
+    let t = std::time::Instant::now();
+    let start_date = &Utc.ymd(2018, 12, 1);
+    let end_date = &Utc.ymd(2019, 2, 1);
 
-    println!("Saving to file...");
+    let res = local_logs.load_date_range(start_date, end_date).unwrap();
+    let spent_loading = t.elapsed().as_secs_f64();
 
-    let t = time::Instant::now();
-    overrustle::save_file("parsed_messages_serialized.bin", &messages);
-    println!("Saving took {:3}s", t.elapsed().as_secs_f64());
+    let messages = overrustle::parse_files(&res);
+    let spent_parsing = t.elapsed().as_secs_f64() - spent_loading;
+
+    println!("Loaded {} messages for interval {:?} -- {:?} in {:.3} s [{:.3}s disk read / {:.3}s parsing]",
+        messages.len(), start_date, end_date, t.elapsed().as_secs_f64(),
+        spent_loading, spent_parsing
+
+    );
+
+    println!("{:#?}", &messages[..1]);
 }
