@@ -16,6 +16,4 @@ reqwest = "0.9"
 scraper = "0.4"
 humantime = "1.2"
 chrono = { version = "0.4", features = ["serde"] }
-jetscii = "0.4"
 serde = { version = "1.0", features = ["derive"] }
-bincode = "*"
