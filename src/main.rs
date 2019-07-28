@@ -5,71 +5,59 @@
 #![feature(unboxed_closures)]
 
 mod chatan;
-use chatan::overrustle;
-use chatan::message::Message;
-use chrono::{DateTime, Utc};
-use reqwest::Client;
+use chatan::overrustle::ChannelLogs;
 
-use crate::chatan::overrustle::LocalChannelLogs;
+use chrono::Utc;
+use chrono::offset::TimeZone;
+
 use std::path::PathBuf;
 use std::str::FromStr;
-use chrono::offset::TimeZone;
 use std::time::Duration;
+use counter::Counter;
 
-struct Window {
-    first: bool
+
+fn most_common(counter: Counter<&str, u64>, threshold: u64) -> Vec<(&str, u64)> {
+    let mut items = counter.iter()
+        .filter_map(|(key, &count)| {
+            if count > threshold {
+                Some((key.clone(), count.clone()))
+            } else { None }
+        })
+        .collect::<Vec<_>>();
+    items.sort_unstable_by(|l, r| r.1.cmp(&l.1));
+    items
 }
 
-impl Window {
-    fn new() -> Window {
-        Window {
-            first: true
-        }
-    }
-}
-
-impl overrustle::WindowFn for Window {
-    fn window_start(&mut self, t0: &DateTime<Utc>, t1: &DateTime<Utc>) -> () {
-//        eprintln!("Started window {:?} -- {:?}", t0, t1);
-        self.first = true;
-    }
-
-    fn window_end(&mut self, t0: &DateTime<Utc>, t1: &DateTime<Utc>) -> () {
-//        eprintln!("Finished window {:?} -- {:?}", t0, t1);
-    }
-
-    fn call(&mut self, msg: &Message) {
-        if self.first {
-//            eprintln!("{:?}", msg);
-            self.first = false;
-        }
-    }
-}
 
 fn main() {
-    let client = Client::new();
+    let mut logs = ChannelLogs::new(PathBuf::from_str(".").unwrap(), "forsen");
+    logs.sync().expect("Couldn't sync channel logs");
+    logs.print_info();
 
-    let mut local_logs = LocalChannelLogs::from_path(
-        &client, "forsen".to_string(), PathBuf::from_str(".").unwrap()
-    ).unwrap();
-
-    local_logs.print_info();
-    local_logs.download(&client, true);
-    local_logs.print_info();
-
-    let start_date = &Utc.ymd(2019, 1, 1);
-    let end_date = &Utc.ymd(2019, 1, 30);
-
-    let start = start_date.and_hms(0, 0, 0);
-    let end = end_date.and_hms(0, 0, 0);
-    let step = Duration::from_secs((2.3 * 86400f64) as u64);
-    let size = Duration::from_secs((5.4234 * 86400f64) as u64);
+    let start = Utc.ymd(2019, 1, 1).and_hms(0, 0, 0);
+    let end = Utc.ymd(2019, 4, 1).and_hms(0, 0, 0);
+    let step = Duration::from_secs(86400 / 1);
+    let size = Duration::from_secs(86400 * 3);
 
     let t = std::time::Instant::now();
 
-    let mut window = Window::new();
+    logs.roll(start, end, step, size, |t0, t1, win| {
+        eprintln!("Processing window {:?} -- {:?}", t0, t1);
+        let mut cnt = 0;
+        let mut counter: Counter<&str, u64> = Counter::new();
 
-    local_logs.roll(start, end, step, size, &mut window);
+        win.for_each(|msg| {
+            cnt += 1;
+            counter += msg.message.split_whitespace();
+        });
+
+        // drop the tokens which are encountered only once
+        let most_common = most_common(counter, 1);
+
+        let top: Vec<&(&str, u64)> = most_common.iter().take(5).collect();
+
+        eprintln!("Entries: {} / Top tokens: {} / Top word: {:?}", cnt, most_common.len(), top);
+    });
 
     eprintln!("Rolling through logs {:?} -- {:?} took {:.3}s", start, end, t.elapsed().as_secs_f64());
 }

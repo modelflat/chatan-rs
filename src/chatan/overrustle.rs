@@ -9,10 +9,10 @@ use scraper::{Html, Selector};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use std::io::Result;
-use std::fs::File;
 use std::path::PathBuf;
 use std::iter::Iterator;
 use std::cmp::min;
+use std::fs::File;
 
 
 const BASE_URL: &str = "https://overrustlelogs.net";
@@ -25,6 +25,7 @@ pub struct LogFileUrl {
 }
 
 impl LogFileUrl {
+
     pub fn from_overrustle_url(url: &str) -> LogFileUrl {
         let date_str = url.rsplitn(2, '/').next().unwrap();
         let date = Date::<Utc>::from_utc(
@@ -34,73 +35,113 @@ impl LogFileUrl {
         );
         LogFileUrl { url: format!("{}{}.txt", BASE_URL, url), path: None, date }
     }
+
+    pub fn from_local_path(channel: &String, path: PathBuf) -> Option<LogFileUrl> {
+        let date_str = path.file_name().unwrap_or("".as_ref()).to_str().unwrap();
+        let date = Date::<Utc>::from_utc(NaiveDate::parse_from_str(date_str, "%Y-%m-%d.txt").ok()?, Utc);
+        let month_name_year = date.format("%B%%20%Y").to_string();
+        let url = format!("{}/{}%20chatlog/{}/{}.txt", BASE_URL, capitalized(channel),
+                          capitalized(&month_name_year), date_str);
+        Some(LogFileUrl { url, path: Some(path), date })
+    }
+
+    pub fn detect_local(&mut self, root_path: &PathBuf) -> bool {
+        let full_path = root_path.join(self.date.format("%Y-%m-%d.txt").to_string());
+        self.path = if full_path.is_file() { Some(full_path) } else { None };
+        self.path.is_some()
+    }
+
 }
 
 #[derive(Debug)]
-pub struct LocalChannelLogs {
-    channel: String,
+pub struct ChannelLogs {
     root_path: PathBuf,
-    index: Vec<LogFileUrl>
+    channel: String,
+    client: Client,
+    index: Vec<LogFileUrl>,
 }
 
-pub trait WindowFn {
-    fn window_start(&mut self, t0: &DateTime<Utc>, t1: &DateTime<Utc>) -> ();
-    fn window_end(&mut self, t0: &DateTime<Utc>, t1: &DateTime<Utc>) -> ();
-    fn call(&mut self, msg: &Message);
-}
+impl ChannelLogs {
 
-impl LocalChannelLogs {
-
-    pub fn from_path(client: &Client, channel: String, root_path: PathBuf) -> Result<LocalChannelLogs> {
-        let root_path = root_path.canonicalize()?.join(&channel);
-        if !root_path.is_dir() {
-            std::fs::create_dir_all(&root_path)?
+    pub fn new(root_path: PathBuf, channel: &str) -> ChannelLogs {
+        ChannelLogs {
+            root_path, channel: channel.to_string(), client: Client::new(), index: Vec::new()
         }
-        let mut o = LocalChannelLogs { channel, root_path, index: Vec::new() };
-        o.update_index(client);
-        Ok(o)
     }
 
-    pub fn update_index(&mut self, client: &Client) {
-        let mut index =  get_all_urls_for_channel(client, &self.channel);
-        let root_path = &self.root_path;
-        index
-            .iter_mut()
-            .for_each(|l| {
-                let filepath = make_file_path(root_path, &l.date);
-                if filepath.is_file() {
-                    let meta = std::fs::metadata(&filepath).expect("Cannot read file metadata");
-                    if meta.len() > 0 { // only count non-empty files
-                        l.path = Some(filepath)
+    fn detect_local_files(&self) -> Result<Vec<LogFileUrl>> {
+        let root_path = self.root_path.canonicalize()?.join(&self.channel);
+
+        let mut index = if !root_path.is_dir() {
+            std::fs::create_dir_all(&root_path)?;
+            Vec::new()
+        } else {
+            std::fs::read_dir(&root_path)?
+                .filter_map(|path| {
+                    let path = path.expect("Cannot get Path from DirEntry").path();
+                    LogFileUrl::from_local_path(&self.channel, path)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        index.sort_unstable_by_key(|l| l.date);
+
+        Ok(index)
+    }
+
+    fn detect_remote_files(&self) -> Result<Vec<LogFileUrl>> {
+        let mut index = get_all_urls_for_channel(&self.client, &self.channel);
+        let root_path = self.root_path.join(&self.channel);
+        {
+            index
+                .iter_mut()
+                .for_each(|l| {
+                    let path = make_file_path(&root_path, &l.date);
+                    if path.is_file() {
+                        let meta = std::fs::metadata(&path).expect("Cannot get metadata for file");
+                        if meta.len() > 0 { // only count non-empty files
+                            l.path = Some(path)
+                        }
                     }
-                }
-            });
-        index.sort_by_key(|l| l.date);
-        self.index = index;
+                });
+        }
+
+        index.sort_unstable_by_key(|l| l.date);
+
+        Ok(index)
     }
 
-    pub fn download(&mut self, client: &Client, missing_only: bool) {
-        let missing_count = self.index.iter()
-            .filter(|l| l.path.is_none())
-            .count();
+    fn download_missing_files(&mut self) -> Result<()> {
+        let missing_count = self.index.iter().filter(|l| l.path.is_none()).count();
         let bar = make_progress_bar(missing_count);
         let root_path = &self.root_path;
+        let client = &self.client;
         let today = Utc::today();
+
         self.index
             .par_iter_mut()
             .for_each(|l: &mut LogFileUrl| {
-                if !missing_only || l.path.is_none() && l.date < today {
+                if l.path.is_none() && l.date < today {
                     let path = make_file_path(root_path, &l.date);
                     if let Ok(mut res) = client.get(&l.url).send() {
-                        let mut file = File::create(&path)
-                            .expect("Unable to create local file");
-                        std::io::copy(&mut res, &mut file)
-                            .expect("Unable to write to local file");
+                        let mut file = File::create(&path).expect("Unable to create local file");
+                        std::io::copy(&mut res, &mut file).expect("Unable to write to local file");
                     }
                     l.path = Some(path);
                     bar.inc(1);
                 }
-            })
+            });
+
+        Ok(())
+    }
+
+    pub fn sync(&mut self) -> Result<()> {
+//        let local = self.detect_local_files();
+        self.index = self.detect_remote_files()?;
+
+        self.download_missing_files()?;
+
+        Ok(())
     }
 
     pub fn print_info(&self) {
@@ -131,8 +172,8 @@ impl LocalChannelLogs {
             .expect("File in index is not a valid UTF8!")
     }
 
-    pub fn roll<F: WindowFn>(
-        &self, start: DateTime<Utc>, end: DateTime<Utc>, step: Duration, size: Duration, f: &mut F
+    pub fn roll<F: Fn(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()>(
+        &self, start: DateTime<Utc>, end: DateTime<Utc>, step: Duration, size: Duration, f: F
     ) {
         // window: size=5, step=1
         // buffer_size = size*2 = 10
@@ -176,7 +217,7 @@ impl LocalChannelLogs {
         let mut loaded_files: Vec<(Date<Utc>, Vec<Message>)> =
             Vec::with_capacity((num_units_in_window * 2) as usize);
 
-        while cur + size < end {
+        while cur + size <= end {
             let cur_start = cur;
             let cur_end = cur + size;
             let cur_date = cur.date();
@@ -202,9 +243,7 @@ impl LocalChannelLogs {
                 date = date + day;
             }
 
-            f.window_start(&cur_start, &cur_end);
-
-            loaded_files
+            let mut window = loaded_files
                 .iter()
                 .flat_map(|(_, file)| {
                     if file.is_empty() {
@@ -219,46 +258,12 @@ impl LocalChannelLogs {
                     };
 
                     file[start_idx..end_idx].iter()
-                })
-                .for_each(|msg| f.call(msg));
+                });
 
-            f.window_end(&cur_start, &cur_end);
+            f(&cur_start, &cur_end, &mut window);
 
             cur = cur + step;
         }
-    }
-
-    pub fn load_date_range(&self, start_date: &Date<Utc>, end_date: &Date<Utc>) -> Option<Vec<(Date<Utc>, String)>> {
-        if self.index.is_empty() || start_date > end_date {
-            return None
-        }
-
-        let start_idx = match self.index.binary_search_by_key(start_date, |l| l.date) {
-            Ok(i) => i, Err(i) => i
-        };
-        let end_idx = match self.index.binary_search_by_key(end_date, |l| l.date) {
-            Ok(i) => i, Err(i) => i
-        };
-
-        let dates = &self.index[start_idx..end_idx + 1];
-        if dates.iter().any(|l| l.path.is_none()) {
-            eprintln!("[load_date_range] some dates are not present in local index!"); // todo logging
-        }
-        if dates.len() as i64 != (end_date.naive_utc() - start_date.naive_utc()).num_days() + 1 {
-            eprintln!("[load_date_range] remote index is missing dates!"); // todo logging
-        }
-
-        let res: Vec<(Date<Utc>, String)> = dates
-            .par_iter()
-            .map(|l| {
-                (l.date, l.path.as_ref().map_or(String::new(), |path| {
-                    String::from_utf8(std::fs::read(path).expect("Index contains non-existing files!"))
-                        .expect("File in index is not a valid UTF8!")
-                }))
-            })
-            .collect();
-
-        Some(res)
     }
 }
 
@@ -302,7 +307,7 @@ fn make_file_path(root_path: &PathBuf, date: &Date<Utc>) -> PathBuf {
     root_path.join(date.format("%Y-%m-%d.txt").to_string())
 }
 
-pub fn get_all_urls_for_channel(client: &Client, channel: &String) -> Vec<LogFileUrl> {
+fn get_all_urls_for_channel(client: &Client, channel: &String) -> Vec<LogFileUrl> {
     let channel_url = format!("{}/{}%20chatlog/", BASE_URL, capitalized(channel));
     let month_urls = select_urls(&client, &channel_url);
 

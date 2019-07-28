@@ -67,6 +67,14 @@ pub fn parse_string(s: &String) -> Vec<Message> {
     s.split_terminator('\n').filter_map(|line| parse_line(line)).collect()
 }
 
+pub mod tokenizer {
+
+    pub fn normal(text: &str) -> std::str::SplitWhitespace {
+        text.split_whitespace()
+    }
+
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
