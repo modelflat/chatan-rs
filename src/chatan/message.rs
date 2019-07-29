@@ -4,8 +4,12 @@ use humantime::parse_rfc3339_weak;
 #[derive(Debug)]
 pub struct Message {
     pub time: DateTime<Utc>,
+
     // We could avoid allocations whatsoever by using &'a str here but this conflicts with
-    // the rolling code and I don't know yet how to do this without diving into unsafe Rust
+    // the rolling code and I don't know yet how to do this without diving into unsafe Rust.
+    // This should be implementable by means of raw pointers to a large string.
+    // Also, please notice that the time of *parsing* messages might be insignificant compared to
+    // *processing* time; this fact may render all these optimizations useless
     pub user: String, // &'a str
     pub message: String, // &'a str
 }
@@ -65,14 +69,6 @@ fn parse_line(line: &str) -> Option<Message> {
 
 pub fn parse_string(s: &String) -> Vec<Message> {
     s.split_terminator('\n').filter_map(|line| parse_line(line)).collect()
-}
-
-pub mod tokenizer {
-
-    pub fn normal(text: &str) -> std::str::SplitWhitespace {
-        text.split_whitespace()
-    }
-
 }
 
 #[cfg(test)]

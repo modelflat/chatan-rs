@@ -8,14 +8,15 @@ use std::time::Duration;
 use scraper::{Html, Selector};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
-use std::io::Result;
+use std::io;
+use std::result::Result;
 use std::path::PathBuf;
 use std::iter::Iterator;
 use std::cmp::min;
 use std::fs::File;
 
-
 const BASE_URL: &str = "https://overrustlelogs.net";
+const SECS_PER_DAY: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub struct LogFileUrl {
@@ -54,6 +55,9 @@ impl LogFileUrl {
 }
 
 #[derive(Debug)]
+pub struct WindowScanError;
+
+#[derive(Debug)]
 pub struct ChannelLogs {
     root_path: PathBuf,
     channel: String,
@@ -69,7 +73,7 @@ impl ChannelLogs {
         }
     }
 
-    fn detect_local_files(&self) -> Result<Vec<LogFileUrl>> {
+    fn detect_local_files(&self) -> io::Result<Vec<LogFileUrl>> {
         let root_path = self.root_path.canonicalize()?.join(&self.channel);
 
         let mut index = if !root_path.is_dir() {
@@ -89,7 +93,7 @@ impl ChannelLogs {
         Ok(index)
     }
 
-    fn detect_remote_files(&self) -> Result<Vec<LogFileUrl>> {
+    fn detect_remote_files(&self) -> io::Result<Vec<LogFileUrl>> {
         let mut index = get_all_urls_for_channel(&self.client, &self.channel);
         let root_path = self.root_path.join(&self.channel);
         {
@@ -111,7 +115,7 @@ impl ChannelLogs {
         Ok(index)
     }
 
-    fn download_missing_files(&mut self) -> Result<()> {
+    fn download_missing_files(&mut self) -> io::Result<()> {
         let missing_count = self.index.iter().filter(|l| l.path.is_none()).count();
         let bar = make_progress_bar(missing_count);
         let root_path = &self.root_path;
@@ -135,12 +139,15 @@ impl ChannelLogs {
         Ok(())
     }
 
-    pub fn sync(&mut self) -> Result<()> {
-//        let local = self.detect_local_files();
-        self.index = self.detect_remote_files()?;
-
-        self.download_missing_files()?;
-
+    pub fn sync(&mut self, offline: bool) -> io::Result<()> {
+        self.index = if offline {
+            self.detect_local_files()?
+        } else {
+            self.detect_remote_files()?
+        };
+        if !offline {
+            self.download_missing_files()?;
+        }
         Ok(())
     }
 
@@ -155,6 +162,7 @@ impl ChannelLogs {
                     .len();
                 a
             });
+
         println!(
             "LocalChannelLogs channel = {} @ local path = {:?}\n:: URLs in index = {}\n\
             :: Local files in index = {}\n:: Total size on disk = {}",
@@ -164,17 +172,38 @@ impl ChannelLogs {
     }
 
     pub fn load_date(&self, date: &Date<Utc>) -> String {
-        let path = self.index[
-            self.index.binary_search_by_key(date, |l| l.date)
-                .expect(format!("Date {:?} is not present in the index", date).as_str())
-            ].path.as_ref().expect("Date not loaded into local index");
-        std::fs::read_to_string(path)
-            .expect("File in index is not a valid UTF8!")
+        let idx = self.index.binary_search_by_key(date, |l| l.date)
+            .expect(format!("Date {:?} is not present in the index", date).as_str());
+
+        let path = self.index[idx].path.as_ref()
+            .expect("Date not loaded into local index");
+
+        std::fs::read_to_string(path).expect("File in index is not a valid UTF8!")
     }
 
-    pub fn roll<F: Fn(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()>(
+    pub fn roll_index<F>(
+        &self, step: Duration, size: Duration, f: F
+    ) -> Result<(), WindowScanError>
+        where F: Fn(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
+    {
+        let start_date = self.index.first().ok_or(WindowScanError {})?.date.and_hms(0, 0, 0);
+        self.roll_update(start_date, step, size, f)
+    }
+
+    pub fn roll_update<F>(
+        &self, start: DateTime<Utc>, step: Duration, size: Duration, f: F
+    ) -> Result<(), WindowScanError>
+        where F: Fn(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
+    {
+        let end_date = day_after(self.index.last().ok_or(WindowScanError {})?.date).and_hms(0, 0, 0);
+        self.roll(start, end_date, step, size, f)
+    }
+
+    pub fn roll<F>(
         &self, start: DateTime<Utc>, end: DateTime<Utc>, step: Duration, size: Duration, f: F
-    ) {
+    ) -> Result<(), WindowScanError>
+        where F: Fn(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
+    {
         // window: size=5, step=1
         // buffer_size = size*2 = 10
         //
@@ -189,13 +218,6 @@ impl ChannelLogs {
         //         |       | .         .
         //           |       |         .
         //           ^ next disjoint window
-        //             |       |       .
-        //               |       |     .
-        //                 |       |   .
-        //                   |       | .
-        //                     |       |
-        //                     ^ next disjoint window
-        //                       |       |
 
         let mut cur = start;
 
@@ -204,9 +226,7 @@ impl ChannelLogs {
         let step = chrono::Duration::from_std(step)
             .expect("??? cannot convert std::time::Duration to chrono::Duration");
 
-        const SECS_PER_DAY: i64 = 24 * 60 * 60; // could be made more generic, but we have file per day
-        let day: chrono::Duration = chrono::Duration::from_std(Duration::from_secs(SECS_PER_DAY as u64)).unwrap();
-
+        // could be made more generic, but we have one file per day
         let num_units_in_window =
             size.num_seconds() / SECS_PER_DAY + if size.num_seconds() % SECS_PER_DAY == 0 { 0 } else { 1 };
 
@@ -228,7 +248,7 @@ impl ChannelLogs {
             let mut date = match loaded_files.last() {
                 Some(v) => {
                     // files up to this date were loaded.
-                    v.0 + day
+                    day_after(v.0)
                 },
                 None => {
                     // no files loaded yet
@@ -240,7 +260,7 @@ impl ChannelLogs {
                 let file = self.load_date(&date);
                 let messages = parse_string(&file);
                 loaded_files.push((date, messages));
-                date = date + day;
+                date = day_after(date);
             }
 
             let mut window = loaded_files
@@ -264,6 +284,7 @@ impl ChannelLogs {
 
             cur = cur + step;
         }
+        Ok(())
     }
 }
 
@@ -275,6 +296,12 @@ fn get_text(client: &Client, url: &String) -> reqwest::Result<String> {
 fn capitalized(s: &String) -> String {
     let ss = s.clone();
     ss.get(0..1).unwrap().to_uppercase() + ss.get(1..ss.len()).unwrap()
+}
+
+fn day_after(date: chrono::Date<Utc>) -> chrono::Date<Utc> {
+    let day = chrono::Duration::from_std(Duration::from_secs(SECS_PER_DAY as u64))
+        .expect("Cannot convert from std Duration to chrono Duration");
+    date + day
 }
 
 fn select_urls(client: &Client, url: &String) -> Vec<String> {

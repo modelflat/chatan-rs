@@ -2,7 +2,7 @@
 #![feature(duration_float)]
 #![feature(drain_filter)]
 #![feature(fn_traits)]
-#![feature(unboxed_closures)]
+//#![feature(unboxed_closures)]
 
 mod chatan;
 use chatan::overrustle::ChannelLogs;
@@ -31,7 +31,7 @@ fn most_common(counter: Counter<&str, u64>, threshold: u64) -> Vec<(&str, u64)> 
 
 fn main() {
     let mut logs = ChannelLogs::new(PathBuf::from_str(".").unwrap(), "forsen");
-    logs.sync().expect("Couldn't sync channel logs");
+    logs.sync(true).expect("Couldn't sync channel logs");
     logs.print_info();
 
     let start = Utc.ymd(2019, 1, 1).and_hms(0, 0, 0);
@@ -57,7 +57,7 @@ fn main() {
         let top: Vec<&(&str, u64)> = most_common.iter().take(5).collect();
 
         eprintln!("Entries: {} / Top tokens: {} / Top word: {:?}", cnt, most_common.len(), top);
-    });
+    }).expect("Failed to roll logs");
 
     eprintln!("Rolling through logs {:?} -- {:?} took {:.3}s", start, end, t.elapsed().as_secs_f64());
 }
