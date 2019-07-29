@@ -118,7 +118,10 @@ impl ChannelLogs {
     fn download_missing_files(&mut self) -> io::Result<()> {
         let missing_count = self.index.iter().filter(|l| l.path.is_none()).count();
         let bar = make_progress_bar(missing_count);
-        let root_path = &self.root_path;
+        let root_path = &self.root_path.join(&self.channel);
+        if !root_path.is_dir() {
+            std::fs::create_dir_all(root_path)?;
+        }
         let client = &self.client;
         let today = Utc::today();
 
@@ -139,13 +142,13 @@ impl ChannelLogs {
         Ok(())
     }
 
-    pub fn sync(&mut self, offline: bool) -> io::Result<()> {
+    pub fn sync(&mut self, download_files: bool, offline: bool) -> io::Result<()> {
         self.index = if offline {
             self.detect_local_files()?
         } else {
             self.detect_remote_files()?
         };
-        if !offline {
+        if !offline && download_files {
             self.download_missing_files()?;
         }
         Ok(())
@@ -171,38 +174,39 @@ impl ChannelLogs {
         )
     }
 
-    pub fn load_date(&self, date: &Date<Utc>) -> String {
-        let idx = self.index.binary_search_by_key(date, |l| l.date)
-            .expect(format!("Date {:?} is not present in the index", date).as_str());
+    pub fn load_date(&self, date: &Date<Utc>) -> Result<String, ()> {
+        let idx = self.index.binary_search_by_key(date, |l| l.date).map_err(|_| ())?;
+//            .expect(format!("Date {:?} is not present in the index", date).as_str());
 
-        let path = self.index[idx].path.as_ref()
-            .expect("Date not loaded into local index");
-
-        std::fs::read_to_string(path).expect("File in index is not a valid UTF8!")
+        let entry = &self.index[idx];
+        match entry.path.as_ref() {
+            Some(path) => Ok(std::fs::read_to_string(path).expect("File in index is not a valid UTF8!")),
+            None => get_text(&self.client, &entry.url).map_err(|_| ())
+        }
     }
 
     pub fn roll_index<F>(
-        &self, step: Duration, size: Duration, f: F
+        &self, step: Duration, size: Duration, mut f: F
     ) -> Result<(), WindowScanError>
-        where F: Fn(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
+        where F: FnMut(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
     {
         let start_date = self.index.first().ok_or(WindowScanError {})?.date.and_hms(0, 0, 0);
         self.roll_update(start_date, step, size, f)
     }
 
     pub fn roll_update<F>(
-        &self, start: DateTime<Utc>, step: Duration, size: Duration, f: F
+        &self, start: DateTime<Utc>, step: Duration, size: Duration, mut f: F
     ) -> Result<(), WindowScanError>
-        where F: Fn(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
+        where F: FnMut(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
     {
         let end_date = day_after(self.index.last().ok_or(WindowScanError {})?.date).and_hms(0, 0, 0);
         self.roll(start, end_date, step, size, f)
     }
 
     pub fn roll<F>(
-        &self, start: DateTime<Utc>, end: DateTime<Utc>, step: Duration, size: Duration, f: F
+        &self, start: DateTime<Utc>, end: DateTime<Utc>, step: Duration, size: Duration, mut f: F
     ) -> Result<(), WindowScanError>
-        where F: Fn(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
+        where F: FnMut(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
     {
         // window: size=5, step=1
         // buffer_size = size*2 = 10
@@ -257,8 +261,15 @@ impl ChannelLogs {
             };
 
             while date < (cur + size + step).date() {
+                // worst error handling ever, todo improve
                 let file = self.load_date(&date);
-                let messages = parse_string(&file);
+                let messages = match file {
+                    Ok(file) => parse_string(&file),
+                    Err(_) => {
+                        eprintln!("Could not load data for date {:?}!", &date);
+                        Vec::new()
+                    }
+                };
                 loaded_files.push((date, messages));
                 date = day_after(date);
             }
