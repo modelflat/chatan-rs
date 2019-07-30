@@ -4,9 +4,17 @@ version = "0.1.0"
 authors = ["modelflat"]
 edition = "2018"
 
-#[lib]
-#name = "chatan"
-#path = "src/chatan/mod.rs"
+[lib]
+name = "chatan"
+path = "src/chatan/lib.rs"
+
+[[bin]]
+name = "rolling_top_words"
+path = "src/jobs/rolling_top_words/main.rs"
+
+[[bin]]
+name = "test"
+path = "src/jobs/test/main.rs"
 
 [dependencies]
 csv = "1.1"

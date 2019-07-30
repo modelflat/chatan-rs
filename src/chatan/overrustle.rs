@@ -1,6 +1,6 @@
 extern crate test;
 
-use crate::chatan::message::*;
+use crate::message::*;
 
 use rayon::prelude::*;
 use chrono::{Date, DateTime, Utc, NaiveDate};
