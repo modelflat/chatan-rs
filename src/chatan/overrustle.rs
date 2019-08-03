@@ -1,19 +1,22 @@
 extern crate test;
 
 use crate::message::*;
+use crate::util::*;
 
-use rayon::prelude::*;
-use chrono::{Date, DateTime, Utc, NaiveDate};
-use std::time::Duration;
-use scraper::{Html, Selector};
-use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::Client;
 use std::io;
 use std::result::Result;
 use std::path::PathBuf;
 use std::iter::Iterator;
 use std::cmp::min;
 use std::fs::File;
+use std::time::Duration;
+
+use rayon::prelude::*;
+use chrono::{Date, DateTime, Utc, NaiveDate};
+use scraper::{Html, Selector};
+use reqwest::Client;
+use log::{info, warn};
+
 
 const BASE_URL: &str = "https://overrustlelogs.net";
 const SECS_PER_DAY: i64 = 24 * 60 * 60;
@@ -57,6 +60,17 @@ impl LogFileUrl {
 #[derive(Debug)]
 pub struct WindowScanError;
 
+pub struct WindowInfo {
+    pub dates: Vec<Date<Utc>>,
+}
+
+impl WindowInfo {
+
+    pub fn new() -> WindowInfo {
+        WindowInfo { dates: Vec::new() }
+    }
+}
+
 #[derive(Debug)]
 pub struct ChannelLogs {
     root_path: PathBuf,
@@ -94,24 +108,20 @@ impl ChannelLogs {
     }
 
     fn detect_remote_files(&self) -> io::Result<Vec<LogFileUrl>> {
-        let mut index = get_all_urls_for_channel(&self.client, &self.channel);
         let root_path = self.root_path.join(&self.channel);
-        {
-            index
-                .iter_mut()
-                .for_each(|l| {
-                    let path = make_file_path(&root_path, &l.date);
-                    if path.is_file() {
-                        let meta = std::fs::metadata(&path).expect("Cannot get metadata for file");
-                        if meta.len() > 0 { // only count non-empty files
-                            l.path = Some(path)
-                        }
+        let mut index = get_all_urls_for_channel(&self.client, &self.channel);
+        index
+            .iter_mut()
+            .for_each(|l| {
+                let path = make_file_path(&root_path, &l.date);
+                if path.is_file() {
+                    let meta = std::fs::metadata(&path).expect("Cannot get metadata for file");
+                    if meta.len() > 0 { // only count non-empty files
+                        l.path = Some(path)
                     }
-                });
-        }
-
+                }
+            });
         index.sort_unstable_by_key(|l| l.date);
-
         Ok(index)
     }
 
@@ -329,16 +339,6 @@ fn select_urls(client: &Client, url: &String) -> Vec<String> {
             urls
         })
         .expect(format!("Failed to load overrustle urls from {}", url).as_str())
-}
-
-fn make_progress_bar(count: usize) -> ProgressBar {
-    let bar = ProgressBar::new(count as u64);
-    bar.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] [{wide_bar}] {percent}% {pos}/{len}")
-            .progress_chars("=> ")
-    );
-    bar
 }
 
 fn make_file_path(root_path: &PathBuf, date: &Date<Utc>) -> PathBuf {
