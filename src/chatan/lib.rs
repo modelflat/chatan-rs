@@ -2,6 +2,7 @@
 #![feature(drain_filter)]
 #![feature(fn_traits)]
 #![feature(unboxed_closures)]
+#![feature(result_map_or_else)]
 
 #[macro_use]
 extern crate runtime_fmt;

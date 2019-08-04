@@ -16,7 +16,9 @@ use chrono::{Date, DateTime, Utc, NaiveDate};
 use scraper::{Html, Selector};
 use reqwest::Client;
 use log::{info, warn};
-
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::io::Write;
 
 const BASE_URL: &str = "https://overrustlelogs.net";
 const SECS_PER_DAY: i64 = 24 * 60 * 60;
@@ -57,9 +59,6 @@ impl LogFileUrl {
 
 }
 
-#[derive(Debug)]
-pub struct WindowScanError;
-
 pub struct WindowInfo {
     pub dates: Vec<Date<Utc>>,
 }
@@ -72,18 +71,48 @@ impl WindowInfo {
 }
 
 #[derive(Debug)]
+pub enum DataLoadMode {
+    /// Data for each index date will be loaded only on demand and won't be cached
+    Remote,
+
+    /// Data for each index date will be loaded only on demand and will be cached on disk
+    RemoteAndCache,
+
+    /// All data in index will be loaded upon calling `ChannelLogs::sync()`.
+    /// If missing data will be encoutered later, an attempt will be made to download it.
+    /// No caching occurs upon these downloads.
+    Prefetch,
+
+    /// All data in index will be loaded upon calling `ChannelLogs::sync()`.
+    /// If missing data will be encoutered later, an attempt will be made to download it.
+    /// If downloaded successfully, will also cache new data to disk.
+    PrefetchAndCache,
+
+    /// Use local storage only. No connection attempts will be made.
+    Local,
+}
+
+/// Designates status of `sliding` through logs
+pub enum SlideStatus {
+    Success,
+    InvalidTimeInterval,
+    NotEnoughDataInIndex,
+}
+
+#[derive(Debug)]
 pub struct ChannelLogs {
     root_path: PathBuf,
     channel: String,
     client: Client,
     index: Vec<LogFileUrl>,
+    mode: DataLoadMode,
 }
 
 impl ChannelLogs {
 
-    pub fn new(root_path: PathBuf, channel: &str) -> ChannelLogs {
+    pub fn new(root_path: PathBuf, channel: &str, mode: DataLoadMode) -> ChannelLogs {
         ChannelLogs {
-            root_path, channel: channel.to_string(), client: Client::new(), index: Vec::new()
+            root_path, channel: channel.to_string(), client: Client::new(), index: Vec::new(), mode
         }
     }
 
@@ -152,93 +181,117 @@ impl ChannelLogs {
         Ok(())
     }
 
-    pub fn sync(&mut self, download_files: bool, offline: bool) -> io::Result<()> {
-        self.index = if offline {
-            self.detect_local_files()?
-        } else {
-            self.detect_remote_files()?
-        };
-        if !offline && download_files {
-            self.download_missing_files()?;
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.index.clear();
+        match self.mode {
+            DataLoadMode::Remote | DataLoadMode::RemoteAndCache => {
+                self.index.extend(self.detect_remote_files()?);
+            },
+            DataLoadMode::Local => {
+                self.index.extend(self.detect_local_files()?);
+            },
+            DataLoadMode::Prefetch | DataLoadMode::PrefetchAndCache => {
+                self.index.extend(self.detect_remote_files()?);
+                self.index.extend(self.detect_local_files()?);
+                self.download_missing_files()?;
+            }
         }
         Ok(())
     }
 
-    pub fn print_info(&self) {
-        let (n_local_files, local_files_size) = self.index
-            .iter()
-            .filter_map(|l| l.path.as_ref())
-            .fold((0u64, 0u64), |mut a, e| {
-                a.0 += 1;
-                a.1 += std::fs::metadata(e)
-                    .expect("Index file does not exist or permission error occured")
-                    .len();
-                a
-            });
-
-        println!(
-            "LocalChannelLogs channel = {} @ local path = {:?}\n:: URLs in index = {}\n\
-            :: Local files in index = {}\n:: Total size on disk = {}",
-            self.channel, self.root_path, self.index.len(),
-            n_local_files, indicatif::HumanBytes(local_files_size)
-        )
-    }
-
-    pub fn load_date(&self, date: &Date<Utc>) -> Result<String, ()> {
+    pub fn load(&mut self, date: &Date<Utc>) -> Result<String, ()> {
+        // TODO proper error handling
         let idx = self.index.binary_search_by_key(date, |l| l.date).map_err(|_| ())?;
-//            .expect(format!("Date {:?} is not present in the index", date).as_str());
+        let entry = &mut self.index[idx];
 
-        let entry = &self.index[idx];
-        match entry.path.as_ref() {
-            Some(path) => Ok(std::fs::read_to_string(path).expect("File in index is not a valid UTF8!")),
-            None => get_text(&self.client, &entry.url).map_err(|_| ())
+        let read_path = |path: &PathBuf|
+            std::fs::read_to_string(path).map_err(|_| ());
+
+        match self.mode {
+            DataLoadMode::Remote | DataLoadMode::Prefetch => {
+                // simply get data from network
+                get_text(&self.client, &entry.url).map_err(|_| ())
+            },
+            DataLoadMode::RemoteAndCache | DataLoadMode::PrefetchAndCache => {
+                match entry.path.as_ref() {
+                    // cache hit, read from path
+                    Some(path) => read_path(&path),
+                    // cache miss, need to download data and save into fs
+                    None => {
+                        let data = get_text(&self.client, &entry.url).map_err(|_| ())?;
+                        let path = make_file_path(&self.root_path, &date);
+                        entry.path = Some(path.clone());
+                        std::fs::write(&path, &data).map_err(|_| ())?;
+                        Ok(data)
+                    }
+                }
+            },
+            DataLoadMode::Local => match entry.path.as_ref() {
+                // read data from path
+                Some(path) => read_path(&path),
+                None => Err(())
+            }
         }
     }
 
-    pub fn roll_index<F>(
-        &self, step: Duration, size: Duration, mut f: F
-    ) -> Result<(), WindowScanError>
+    /// Iterate over the index with given step, using sliding window of given size
+    /// and window function F.
+    pub fn slide_index<F>(
+        &mut self, step: Duration, size: Duration, mut f: F
+    ) -> SlideStatus
         where F: FnMut(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
     {
-        let start_date = self.index.first().ok_or(WindowScanError {})?.date.and_hms(0, 0, 0);
-        self.roll_update(start_date, step, size, f)
+        if self.index.is_empty() {
+            return SlideStatus::NotEnoughDataInIndex
+        }
+        let start = self.index[0].date.and_hms(0, 0, 0);
+        self.slide_update(start, step, size, f)
     }
 
-    pub fn roll_update<F>(
-        &self, start: DateTime<Utc>, step: Duration, size: Duration, mut f: F
-    ) -> Result<(), WindowScanError>
+    /// Iterate over the index from given time to the end, using given step, sliding
+    /// window of given size and window function F.
+    pub fn slide_update<F>(
+        &mut self, start: DateTime<Utc>, step: Duration, size: Duration, mut f: F
+    ) -> SlideStatus
         where F: FnMut(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
     {
-        let end_date = day_after(self.index.last().ok_or(WindowScanError {})?.date).and_hms(0, 0, 0);
-        self.roll(start, end_date, step, size, f)
+        if self.index.is_empty() {
+            return SlideStatus::NotEnoughDataInIndex
+        }
+        let end = day_after(self.index[0].date).and_hms(0, 0, 0);
+        self.slide(start, end, step, size, f)
     }
 
-    pub fn roll<F>(
-        &self, start: DateTime<Utc>, end: DateTime<Utc>, step: Duration, size: Duration, mut f: F
-    ) -> Result<(), WindowScanError>
+    /// Iterate over the time interval within the index, using given step, sliding
+    /// window of given size and window function F.
+    ///
+    /// Returns an `SlideStatus::InvalidTimeInterval` if start or end time is outside of the index,
+    /// if start > end or if window size > index size.
+    /// Returns `SlideStatus::NotEnoughDataInIndex` if index is empty
+    pub fn slide<F>(
+        &mut self, start: DateTime<Utc>, end: DateTime<Utc>, step: Duration, size: Duration, mut f: F
+    ) -> SlideStatus
         where F: FnMut(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
     {
-        // window: size=5, step=1
-        // buffer_size = size*2 = 10
-        //
-        //  part 1  ' part 2  ' part 1  '
-        // --------- --------- ---------
-        // * * * * * * * * * * * * * * * *
-        //         .         .         .
-        // |       |         .         .
-        //   |       |       .         .
-        //     |       |     .         .
-        //       |       |   .         .
-        //         |       | .         .
-        //           |       |         .
-        //           ^ next disjoint window
+        if self.index.is_empty() {
+            return SlideStatus::NotEnoughDataInIndex;
+        }
 
-        let mut cur = start;
+        let index_size = day_after(self.index.last().unwrap().date) - self.index.first().unwrap().date;
+        if start > end || (end - start) > index_size {
+            return SlideStatus::InvalidTimeInterval;
+        }
 
         let size = chrono::Duration::from_std(size)
             .expect("??? cannot convert std::time::Duration to chrono::Duration");
         let step = chrono::Duration::from_std(step)
             .expect("??? cannot convert std::time::Duration to chrono::Duration");
+
+        if size > index_size {
+            return SlideStatus::NotEnoughDataInIndex;
+        }
+
+        let mut cur = start;
 
         // could be made more generic, but we have one file per day
         let num_units_in_window =
@@ -271,12 +324,10 @@ impl ChannelLogs {
             };
 
             while date < (cur + size + step).date() {
-                // worst error handling ever, todo improve
-                let file = self.load_date(&date);
+                let file = self.load(&date);
                 let messages = match file {
                     Ok(file) => parse_string(&file),
                     Err(_) => {
-                        eprintln!("Could not load data for date {:?}!", &date);
                         Vec::new()
                     }
                 };
@@ -305,24 +356,37 @@ impl ChannelLogs {
 
             cur = cur + step;
         }
-        Ok(())
+
+        SlideStatus::Success
+    }
+}
+
+impl Display for ChannelLogs {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        let (n_local_files, local_files_size) = self.index
+            .iter()
+            .filter_map(|l| l.path.as_ref())
+            .fold((0u64, 0u64), |mut a, e| {
+                a.0 += 1;
+                a.1 += std::fs::metadata(e).map_or_else(|_| 0, |m| m.len());
+                a
+            });
+
+        write!(
+            f,
+            "ChannelLogs {{ {channel} @ local_path = {path:?} ; URLs in index = {index_size} ;\
+             Local files in index = {local_count} ; Total size on disk = {size} }}",
+            channel = self.channel,
+            path = self.root_path,
+            index_size = self.index.len(),
+            local_count = n_local_files,
+            size = indicatif::HumanBytes(local_files_size)
+        )
     }
 }
 
 fn get_text(client: &Client, url: &String) -> reqwest::Result<String> {
     client.get(url).send()?.text()
-}
-
-// wtf why doesn't Rust have this built-in?
-fn capitalized(s: &String) -> String {
-    let ss = s.clone();
-    ss.get(0..1).unwrap().to_uppercase() + ss.get(1..ss.len()).unwrap()
-}
-
-fn day_after(date: chrono::Date<Utc>) -> chrono::Date<Utc> {
-    let day = chrono::Duration::from_std(Duration::from_secs(SECS_PER_DAY as u64))
-        .expect("Cannot convert from std Duration to chrono Duration");
-    date + day
 }
 
 fn select_urls(client: &Client, url: &String) -> Vec<String> {

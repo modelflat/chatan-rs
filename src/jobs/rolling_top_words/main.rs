@@ -2,7 +2,7 @@
 
 extern crate chatan;
 
-use chatan::overrustle::ChannelLogs;
+use chatan::overrustle::{ChannelLogs, DataLoadMode};
 use chrono::{Utc, DateTime};
 use chrono::offset::TimeZone;
 
@@ -27,9 +27,8 @@ impl RollingTopWords {
 }
 
 fn main() {
-    let mut logs = ChannelLogs::new(PathBuf::from_str(".").unwrap(), "forsen");
-    logs.sync(false, true).expect("Couldn't sync channel logs");
-    logs.print_info();
+    let mut logs = ChannelLogs::new(PathBuf::from_str(".").unwrap(), "forsen", DataLoadMode::Local);
+    logs.sync().expect("Couldn't sync channel logs");
 
     let start = Utc.ymd(2015, 5, 1).and_hms(0, 0, 0);
     let end = Utc.ymd(2019, 5, 1).and_hms(0, 0, 0);
@@ -41,7 +40,7 @@ fn main() {
     let top = 100;
     let mut result = Vec::new();
 
-    logs.roll(start, end, step, size, |t0, t1, win| {
+    logs.slide(start, end, step, size, |t0, t1, win| {
         eprintln!("Processing window {:?} -- {:?}", t0, t1);
         let mut cnt = 0;
         let mut counter: Counter<&str, u64> = Counter::new();
@@ -63,7 +62,7 @@ fn main() {
         result.push(RollingTopWords::new(*t0, *t1, top_words));
 
         eprintln!("Entries: {} / Tokens: {}", cnt, tokens);
-    }).expect("Failed to roll over logs");
+    });
 
     let file = File::create("top_words.json").expect("Cannot create output file");
     serde_json::to_writer(file, &result).expect("Could not write output file");
