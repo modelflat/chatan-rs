@@ -12,16 +12,8 @@ name = "rolling_top"
 path = "jobs/rolling_top/main.rs"
 
 [[bin]]
-name = "top"
-path = "jobs/top/main.rs"
-
-[[bin]]
-name = "emote_index"
+name = "emote-index"
 path = "jobs/emote_index/main.rs"
-
-[[bin]]
-name = "discover_emotes"
-path = "jobs/discover_emotes/main.rs"
 
 [dependencies]
 csv = "1.1"

@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use std::path::Path;
 use crate::util::make_progress_bar;
 
-type EmoteIndex = HashMap<String, EmoteInfo>;
+pub type EmoteIndex = HashMap<String, EmoteInfo>;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EmoteInfo {
@@ -28,12 +28,20 @@ impl EmoteInfo {
 
     fn new(
         provider_name: String, img_type: String, urls: Vec<String>,
-        image: DynamicImage
+        average_color: (u8, u8, u8)
     ) -> EmoteInfo {
-        let [r, g, b, _] = image.thumbnail_exact(1, 1).get_pixel(0, 0).0;
         EmoteInfo {
-            provider: provider_name, img_type, urls, average_color: (r, g, b)
+            provider: provider_name, img_type, urls, average_color
         }
+    }
+
+    fn with_color_from_url(
+        client: &Client, provider_name: String, img_type: String, urls: Vec<String>
+    ) -> Option<EmoteInfo> {
+        let image = download_image(client, urls.first().unwrap())?;
+
+        let [r, g, b, _] = image.thumbnail_exact(1, 1).get_pixel(0, 0).0;
+        Some(EmoteInfo::new(provider_name, img_type, urls, (r, g, b)))
     }
 
 }
@@ -43,7 +51,7 @@ pub trait EmoteProvider {
 
     fn fetch(&self, client: &Client, channel: Option<String>) -> Result<EmoteIndex, Box<dyn Error>>;
 
-//    fn is_emote(&self, name: String) -> Option<EmoteInfo>;
+    fn find_emotes(&self, client: &Client, names: &[String]) -> EmoteIndex;
 }
 
 pub struct TwitchMetrics {
@@ -128,27 +136,46 @@ impl EmoteProvider for TwitchMetrics {
                     format!("{}/3.0", url),
                 ];
 
-                let min_image = download_image(client, urls.first().unwrap())?;
-
                 Some((name.to_owned(),
-                      EmoteInfo::new("twitch".to_string(), "png".to_string(), urls, min_image)))
+                      EmoteInfo::with_color_from_url(client, "twitch".to_string(), "png".to_string(), urls)?))
             })
             .collect::<HashMap<_, _>>();
 
         Ok(result)
     }
 
+    fn find_emotes(&self, _client: &Client, _names: &[String]) -> EmoteIndex {
+        unimplemented!()
+    }
 }
 
 pub struct BetterTTV;
+
+#[derive(Deserialize)]
+struct BTTVEmote {
+    id: String,
+    code: String,
+    #[serde(rename = "imageType")]
+    image_type: String,
+}
 
 impl BetterTTV {
     pub fn new() -> BetterTTV {
         BetterTTV { }
     }
+
+    fn make_emote_info(client: &Client, emote: &BTTVEmote) -> Option<EmoteInfo> {
+        let urls = vec![
+            format!("http://cdn.betterttv.net/emote/{id}/{image}", id = emote.id, image = "1x"),
+            format!("http://cdn.betterttv.net/emote/{id}/{image}", id = emote.id, image = "2x"),
+            format!("http://cdn.betterttv.net/emote/{id}/{image}", id = emote.id, image = "3x"),
+        ];
+        EmoteInfo::with_color_from_url(client, "bttv".to_string(), emote.image_type.clone(), urls)
+    }
 }
 
 impl EmoteProvider for BetterTTV {
+
     fn name(&self) -> &str {
         "bttv"
     }
@@ -158,17 +185,7 @@ impl EmoteProvider for BetterTTV {
         const BASE_CHANNEL_URL: &str = "https://api.betterttv.net/2/channels";
 
         #[derive(Deserialize)]
-        struct BTTVEmote {
-            id: String,
-            code: String,
-            #[serde(rename = "imageType")]
-            image_type: String,
-        };
-
-        #[derive(Deserialize)]
         struct BTTVApiResponse {
-            #[serde(rename = "urlTemplate")]
-            url_template: String,
             emotes: Vec<BTTVEmote>,
         };
 
@@ -178,35 +195,61 @@ impl EmoteProvider for BetterTTV {
         };
 
         let emotes: BTTVApiResponse = client.get(&url).send()?.json()?;
-        // this normalizes the template
-        let url_template = format!("https:{}", rt_format!(&emotes.url_template).unwrap());
 
         let result = emotes.emotes
             .par_iter()
             .filter_map(|emote| {
-                let urls = vec![
-                    rt_format!(url_template, id = emote.id, image = "1x").expect("Cannot format BTTV template string"),
-                    rt_format!(url_template, id = emote.id, image = "2x").expect("Cannot format BTTV template string"),
-                    rt_format!(url_template, id = emote.id, image = "3x").expect("Cannot format BTTV template string"),
-                ];
-
-                let min_image = download_image(client, urls.first().unwrap())?;
-
-                Some((emote.code.clone(),
-                      EmoteInfo::new("bttv".to_string(), emote.image_type.clone(), urls, min_image)))
-
+                Some((emote.code.clone(), Self::make_emote_info(client, emote)?))
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<EmoteIndex>();
 
         Ok(result)
+    }
+
+    fn find_emotes(&self, client: &Client, names: &[String]) -> EmoteIndex {
+        let bar = make_progress_bar(names.len());
+        let res = names
+            .par_iter()
+            .filter_map(|name| {
+                let emotes: Vec<BTTVEmote> = client.get(&format!(
+                    "https://api.betterttv.net/3/emotes/shared/search?query={}&offset=0&limit=1", name
+                )).send().ok()?.json().ok()?;
+                bar.inc(1);
+                Some((
+                    name.clone(),
+                    emotes.first().and_then(|emote| Self::make_emote_info(client, emote))?
+                ))
+            })
+            .collect::<EmoteIndex>();
+        bar.finish();
+        res
     }
 }
 
 pub struct FrankerFaceZ;
 
+#[derive(Deserialize)]
+struct FFZEmote {
+    name: String,
+    urls: BTreeMap<i32, String>,
+}
+
+#[derive(Deserialize)]
+struct FFZEmoteSet {
+    emoticons: Vec<FFZEmote>,
+}
+
 impl FrankerFaceZ {
     pub fn new() -> FrankerFaceZ {
         FrankerFaceZ {}
+    }
+
+    fn make_emote_info(client: &Client, emote: &FFZEmote) -> Option<EmoteInfo> {
+        let urls = emote.urls.iter()
+            .map(|(_, url)| format!("https:{}", url))
+            .collect::<Vec<String>>();
+
+        EmoteInfo::with_color_from_url(client, "ffz".to_string(), "png".to_string(), urls)
     }
 }
 
@@ -219,25 +262,14 @@ impl EmoteProvider for FrankerFaceZ {
         const BASE_URL: &str = "https://api.frankerfacez.com/v1/set/global";
         const BASE_CHANNEL_URL: &str = "https://api.frankerfacez.com/v1/room";
 
-        #[derive(Deserialize)]
-        struct FFZEmote {
-            name: String,
-            urls: BTreeMap<i32, String>,
+        let url = match channel {
+            Some(channel) => format!("{}/{}", BASE_CHANNEL_URL, &channel),
+            None => BASE_URL.to_string()
         };
-
-        #[derive(Deserialize)]
-        struct FFZEmoteSet {
-            emoticons: Vec<FFZEmote>,
-        }
 
         #[derive(Deserialize)]
         struct FFZApiResponse {
             sets: HashMap<String, FFZEmoteSet>,
-        };
-
-        let url = match channel {
-            Some(channel) => format!("{}/{}", BASE_CHANNEL_URL, &channel),
-            None => BASE_URL.to_string()
         };
 
         let emotes: FFZApiResponse = client.get(&url).send()?.json()?;
@@ -246,20 +278,31 @@ impl EmoteProvider for FrankerFaceZ {
             .iter()
             .flat_map(|(_, set)| set.emoticons.iter())
             .par_bridge()
-            .filter_map(|emote: &FFZEmote| {
-                let urls = emote.urls.iter()
-                    .map(|(_, url)| format!("https:{}", url))
-                    .collect::<Vec<String>>();
-
-                let min_image = download_image(client, urls.first()?)?;
-
-                Some((emote.name.clone(),
-                      EmoteInfo::new("ffz".to_string(), "png".to_string(), urls, min_image)))
-
+            .filter_map(|emote| {
+                Some((emote.name.clone(), Self::make_emote_info(client, emote)?))
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<EmoteIndex>();
 
         Ok(result)
+    }
+
+    fn find_emotes(&self, client: &Client, names: &[String]) -> EmoteIndex {
+        let bar = make_progress_bar(names.len());
+        let res = names
+            .par_iter()
+            .filter_map(|name| {
+                let emotes: FFZEmoteSet = client.get(&format!(
+                    "https://api.frankerfacez.com/v1/emoticons?q={}&per_page=1", name
+                )).send().ok()?.json().ok()?;
+                bar.inc(1);
+                Some((
+                    name.clone(),
+                    emotes.emoticons.first().and_then(|emote| Self::make_emote_info(client, emote))?
+                ))
+            })
+            .collect::<EmoteIndex>();
+        bar.finish();
+        res
     }
 }
 
@@ -316,15 +359,19 @@ pub fn build_index(client: &Client, channels: Vec<String>, providers: Vec<Box<dy
     merge_indexes(emotes)
 }
 
-pub fn update_index_in_path(client: &Client, path: &Path, channels: Vec<String>, providers: Vec<Box<dyn EmoteProvider>>)
+pub fn update_index_in_path(client: &Client, channels: Vec<String>, providers: Vec<Box<dyn EmoteProvider>>,
+                            input_path: &Path, output_path: Option<&Path>)
     -> io::Result<EmoteIndex> {
-    let old = load_index(path).unwrap_or_else(|_| EmoteIndex::new());
+    let old = load_index(input_path).unwrap_or_else(|_| EmoteIndex::new());
 
     let index = merge_indexes(
         vec![old, build_index(client, channels, providers)]
     );
 
-    save_index(&path, &index)?;
+    save_index(&match output_path {
+        Some(output_path) => output_path,
+        None => input_path
+    }, &index)?;
 
     Ok(index)
 }

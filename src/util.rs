@@ -22,7 +22,7 @@ pub fn most_common(counter: Counter<&str, u64>, threshold: u64) -> Vec<(&str, u6
     items
 }
 
-pub(crate) fn make_progress_bar(count: usize) -> ProgressBar {
+pub fn make_progress_bar(count: usize) -> ProgressBar {
     if !PROGRESS_BAR_ENABLED.load(Ordering::SeqCst) {
         return ProgressBar::hidden();
     }
