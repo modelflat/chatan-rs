@@ -2,26 +2,24 @@ extern crate test;
 
 use crate::message::*;
 use crate::util::*;
+use crate::chatlog::DailyChatLog;
 
 use std::io;
 use std::result::Result;
 use std::path::PathBuf;
 use std::iter::Iterator;
-use std::cmp::min;
 use std::fs::File;
-use std::time::Duration;
 
 use rayon::prelude::*;
-use chrono::{Date, DateTime, Utc, NaiveDate};
+use chrono::{Date, Utc, NaiveDate};
 use scraper::{Html, Selector};
 use reqwest::Client;
-use log::{info, warn};
-use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::io::Write;
+use std::str::FromStr;
+use crate::message::overrustle::parse_string;
 
 const BASE_URL: &str = "https://overrustlelogs.net";
-const SECS_PER_DAY: i64 = 24 * 60 * 60;
+
 
 #[derive(Debug, Clone)]
 pub struct LogFileUrl {
@@ -59,17 +57,7 @@ impl LogFileUrl {
 
 }
 
-pub struct WindowInfo {
-    pub dates: Vec<Date<Utc>>,
-}
-
-impl WindowInfo {
-
-    pub fn new() -> WindowInfo {
-        WindowInfo { dates: Vec::new() }
-    }
-}
-
+/// Data load mode for
 #[derive(Debug)]
 pub enum DataLoadMode {
     /// Data for each index date will be loaded only on demand and won't be cached
@@ -92,15 +80,42 @@ pub enum DataLoadMode {
     Local,
 }
 
-/// Designates status of `sliding` through logs
-pub enum SlideStatus {
-    Success,
+// TODO replace with macro. But don't depend on the external crates, that seems to be an overkill for now
+impl FromStr for DataLoadMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "remote" => Ok(DataLoadMode::Remote),
+            "remoteandcache" => Ok(DataLoadMode::RemoteAndCache),
+            "prefetch" => Ok(DataLoadMode::Prefetch),
+            "prefetchandcache" => Ok(DataLoadMode::PrefetchAndCache),
+            "local" => Ok(DataLoadMode::Local),
+            _ => Err(s.to_string())
+        }
+    }
+}
+
+// TODO same
+impl ToString for DataLoadMode {
+    fn to_string(&self) -> String {
+        match self {
+            DataLoadMode::Local => "Local".to_string(),
+            DataLoadMode::Remote => "Remote".to_string(),
+            DataLoadMode::RemoteAndCache => "RemoteAndCache".to_string(),
+            DataLoadMode::Prefetch => "Prefetch".to_string(),
+            DataLoadMode::PrefetchAndCache => "PrefetchAndCache".to_string(),
+        }
+    }
+}
+
+pub enum SlideError {
     InvalidTimeInterval,
     NotEnoughDataInIndex,
 }
 
 #[derive(Debug)]
-pub struct ChannelLogs {
+pub struct OverRustleLogs {
     root_path: PathBuf,
     channel: String,
     client: Client,
@@ -108,12 +123,21 @@ pub struct ChannelLogs {
     mode: DataLoadMode,
 }
 
-impl ChannelLogs {
+impl OverRustleLogs {
 
-    pub fn new(root_path: PathBuf, channel: &str, mode: DataLoadMode) -> ChannelLogs {
-        ChannelLogs {
-            root_path, channel: channel.to_string(), client: Client::new(), index: Vec::new(), mode
+    pub fn new(root_path: PathBuf, channel: String, mode: DataLoadMode) -> OverRustleLogs {
+        OverRustleLogs {
+            root_path, channel, client: Client::new(), index: Vec::new(), mode
         }
+    }
+
+    pub fn make_and_sync(root_path: PathBuf, channel: String, mode: DataLoadMode) -> OverRustleLogs {
+        let mut o = OverRustleLogs::new(root_path, channel, mode);
+        o.sync().expect("Could not sync logs");
+        if o.range().is_none() {
+            panic!("Logs are empty after calling .sync()");
+        }
+        o
     }
 
     fn detect_local_files(&self) -> io::Result<Vec<LogFileUrl>> {
@@ -192,176 +216,15 @@ impl ChannelLogs {
             },
             DataLoadMode::Prefetch | DataLoadMode::PrefetchAndCache => {
                 self.index.extend(self.detect_remote_files()?);
-                self.index.extend(self.detect_local_files()?);
                 self.download_missing_files()?;
             }
         }
         Ok(())
     }
 
-    pub fn load(&mut self, date: &Date<Utc>) -> Result<String, ()> {
-        // TODO proper error handling
-        let idx = self.index.binary_search_by_key(date, |l| l.date).map_err(|_| ())?;
-        let entry = &mut self.index[idx];
-
-        let read_path = |path: &PathBuf|
-            std::fs::read_to_string(path).map_err(|_| ());
-
-        match self.mode {
-            DataLoadMode::Remote | DataLoadMode::Prefetch => {
-                // simply get data from network
-                get_text(&self.client, &entry.url).map_err(|_| ())
-            },
-            DataLoadMode::RemoteAndCache | DataLoadMode::PrefetchAndCache => {
-                match entry.path.as_ref() {
-                    // cache hit, read from path
-                    Some(path) => read_path(&path),
-                    // cache miss, need to download data and save into fs
-                    None => {
-                        let data = get_text(&self.client, &entry.url).map_err(|_| ())?;
-                        let path = make_file_path(&self.root_path, &date);
-                        entry.path = Some(path.clone());
-                        std::fs::write(&path, &data).map_err(|_| ())?;
-                        Ok(data)
-                    }
-                }
-            },
-            DataLoadMode::Local => match entry.path.as_ref() {
-                // read data from path
-                Some(path) => read_path(&path),
-                None => Err(())
-            }
-        }
-    }
-
-    /// Iterate over the index with given step, using sliding window of given size
-    /// and window function F.
-    pub fn slide_index<F>(
-        &mut self, step: Duration, size: Duration, mut f: F
-    ) -> SlideStatus
-        where F: FnMut(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
-    {
-        if self.index.is_empty() {
-            return SlideStatus::NotEnoughDataInIndex
-        }
-        let start = self.index[0].date.and_hms(0, 0, 0);
-        self.slide_update(start, step, size, f)
-    }
-
-    /// Iterate over the index from given time to the end, using given step, sliding
-    /// window of given size and window function F.
-    pub fn slide_update<F>(
-        &mut self, start: DateTime<Utc>, step: Duration, size: Duration, mut f: F
-    ) -> SlideStatus
-        where F: FnMut(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
-    {
-        if self.index.is_empty() {
-            return SlideStatus::NotEnoughDataInIndex
-        }
-        let end = day_after(self.index[0].date).and_hms(0, 0, 0);
-        self.slide(start, end, step, size, f)
-    }
-
-    /// Iterate over the time interval within the index, using given step, sliding
-    /// window of given size and window function F.
-    ///
-    /// Returns an `SlideStatus::InvalidTimeInterval` if start or end time is outside of the index,
-    /// if start > end or if window size > index size.
-    /// Returns `SlideStatus::NotEnoughDataInIndex` if index is empty
-    pub fn slide<F>(
-        &mut self, start: DateTime<Utc>, end: DateTime<Utc>, step: Duration, size: Duration, mut f: F
-    ) -> SlideStatus
-        where F: FnMut(&DateTime<Utc>, &DateTime<Utc>, &mut dyn Iterator<Item=&Message>) -> ()
-    {
-        if self.index.is_empty() {
-            return SlideStatus::NotEnoughDataInIndex;
-        }
-
-        let index_size = day_after(self.index.last().unwrap().date) - self.index.first().unwrap().date;
-        if start > end || (end - start) > index_size {
-            return SlideStatus::InvalidTimeInterval;
-        }
-
-        let size = chrono::Duration::from_std(size)
-            .expect("??? cannot convert std::time::Duration to chrono::Duration");
-        let step = chrono::Duration::from_std(step)
-            .expect("??? cannot convert std::time::Duration to chrono::Duration");
-
-        if size > index_size {
-            return SlideStatus::NotEnoughDataInIndex;
-        }
-
-        let mut cur = start;
-
-        // could be made more generic, but we have one file per day
-        let num_units_in_window =
-            size.num_seconds() / SECS_PER_DAY + if size.num_seconds() % SECS_PER_DAY == 0 { 0 } else { 1 };
-
-        let _num_units_in_step = min(
-            step.num_seconds() / SECS_PER_DAY + if step.num_seconds() % SECS_PER_DAY == 0 { 0 } else { 1 }, 1
-        );
-
-        let mut loaded_files: Vec<(Date<Utc>, Vec<Message>)> =
-            Vec::with_capacity((num_units_in_window * 2) as usize);
-
-        while cur + size <= end {
-            let cur_start = cur;
-            let cur_end = cur + size;
-            let cur_date = cur.date();
-
-            // unload files that are no longer needed
-            loaded_files.drain_filter(|e| e.0 < cur_date);
-
-            let mut date = match loaded_files.last() {
-                Some(v) => {
-                    // files up to this date were loaded.
-                    day_after(v.0)
-                },
-                None => {
-                    // no files loaded yet
-                    cur_date
-                }
-            };
-
-            while date < (cur + size + step).date() {
-                let file = self.load(&date);
-                let messages = match file {
-                    Ok(file) => parse_string(&file),
-                    Err(_) => {
-                        Vec::new()
-                    }
-                };
-                loaded_files.push((date, messages));
-                date = day_after(date);
-            }
-
-            let mut window = loaded_files
-                .iter()
-                .flat_map(|(_, file)| {
-                    if file.is_empty() {
-                        return file.iter();
-                    }
-
-                    let start_idx = match file.binary_search_by_key(&cur_start, |m| m.time) {
-                        Ok(x) => x, Err(x) => x
-                    };
-                    let end_idx = match file.binary_search_by_key(&cur_end, |m| m.time) {
-                        Ok(x) => x, Err(x) => x
-                    };
-
-                    file[start_idx..end_idx].iter()
-                });
-
-            f(&cur_start, &cur_end, &mut window);
-
-            cur = cur + step;
-        }
-
-        SlideStatus::Success
-    }
 }
 
-impl Display for ChannelLogs {
+impl Display for OverRustleLogs {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let (n_local_files, local_files_size) = self.index
             .iter()
@@ -374,14 +237,63 @@ impl Display for ChannelLogs {
 
         write!(
             f,
-            "ChannelLogs {{ {channel} @ local_path = {path:?} ; URLs in index = {index_size} ;\
-             Local files in index = {local_count} ; Total size on disk = {size} }}",
+            "ChannelLogs {{ {channel} @ data_load_mode = {mode:?} ; local_path = {path:?} ; \
+             URLs in index = {index_size} ; Local files in index = {local_count} ; Total size on disk = {size} }}",
             channel = self.channel,
+            mode = self.mode,
             path = self.root_path,
             index_size = self.index.len(),
             local_count = n_local_files,
             size = indicatif::HumanBytes(local_files_size)
         )
+    }
+}
+
+impl DailyChatLog for OverRustleLogs {
+
+    fn range(&self) -> Option<(Date<Utc>, Date<Utc>)> {
+        if self.index.is_empty() {
+            None
+        } else {
+            Some((self.index.first().unwrap().date, self.index.last().unwrap().date))
+        }
+    }
+
+    fn load(&mut self, date: &Date<Utc>) -> Option<Messages> {
+        // TODO proper error handling
+        let idx = self.index.binary_search_by_key(date, |l| l.date).map_err(|_| ()).ok()?;
+        let entry = &mut self.index[idx];
+
+        let read_path = |path: &PathBuf|
+            std::fs::read_to_string(path).map_err(|_| ());
+
+        let res = match self.mode {
+            DataLoadMode::Remote => {
+                // simply get data from network
+                get_text(&self.client, &entry.url).map_err(|_| ())
+            },
+            DataLoadMode::RemoteAndCache | DataLoadMode::PrefetchAndCache => {
+                match entry.path.as_ref() {
+                    // cache hit, read from path
+                    Some(path) => read_path(&path),
+                    // cache miss, need to download data and save into fs
+                    None => {
+                        let data = get_text(&self.client, &entry.url).map_err(|_| ()).ok()?;
+                        let path = make_file_path(&self.root_path, &date);
+                        entry.path = Some(path.clone());
+                        std::fs::write(&path, &data).map_err(|_| ()).ok()?;
+                        Ok(data)
+                    }
+                }
+            },
+            DataLoadMode::Local | DataLoadMode::Prefetch => match entry.path.as_ref() {
+                // read data from path
+                Some(path) => read_path(&path),
+                None => Err(())
+            }
+        };
+
+        Some(res.map_or_else(|_| Messages::empty(), |s| parse_string(s)))
     }
 }
 

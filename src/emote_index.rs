@@ -15,12 +15,12 @@ type EmoteIndex = HashMap<String, EmoteInfo>;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EmoteInfo {
-    #[serde(rename(serialize = "from"))]
+    #[serde(rename = "from")]
     pub provider: String,
-    #[serde(rename(serialize = "type"))]
+    #[serde(rename = "type")]
     pub img_type: String,
     pub urls: Vec<String>,
-    #[serde(rename(serialize = "color"))]
+    #[serde(rename = "color")]
     pub average_color: (u8, u8, u8),
 }
 
@@ -40,7 +40,10 @@ impl EmoteInfo {
 
 pub trait EmoteProvider {
     fn name(&self) -> &str;
+
     fn fetch(&self, client: &Client, channel: Option<String>) -> Result<EmoteIndex, Box<dyn Error>>;
+
+//    fn is_emote(&self, name: String) -> Option<EmoteInfo>;
 }
 
 pub struct TwitchMetrics {
@@ -184,7 +187,7 @@ impl EmoteProvider for BetterTTV {
                 let urls = vec![
                     rt_format!(url_template, id = emote.id, image = "1x").expect("Cannot format BTTV template string"),
                     rt_format!(url_template, id = emote.id, image = "2x").expect("Cannot format BTTV template string"),
-                    rt_format!(url_template, id = emote.id, image = "4x").expect("Cannot format BTTV template string"),
+                    rt_format!(url_template, id = emote.id, image = "3x").expect("Cannot format BTTV template string"),
                 ];
 
                 let min_image = download_image(client, urls.first().unwrap())?;

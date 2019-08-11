@@ -2,6 +2,13 @@ use std::time::Duration;
 use chrono::Utc;
 use counter::Counter;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static PROGRESS_BAR_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn progress_bar(enabled: bool) {
+    PROGRESS_BAR_ENABLED.store(enabled, Ordering::SeqCst)
+}
 
 pub fn most_common(counter: Counter<&str, u64>, threshold: u64) -> Vec<(&str, u64)> {
     let mut items = counter.iter()
@@ -16,6 +23,9 @@ pub fn most_common(counter: Counter<&str, u64>, threshold: u64) -> Vec<(&str, u6
 }
 
 pub(crate) fn make_progress_bar(count: usize) -> ProgressBar {
+    if !PROGRESS_BAR_ENABLED.load(Ordering::SeqCst) {
+        return ProgressBar::hidden();
+    }
     let bar = ProgressBar::new(count as u64);
     bar.set_style(
         ProgressStyle::default_bar()
@@ -25,7 +35,7 @@ pub(crate) fn make_progress_bar(count: usize) -> ProgressBar {
     bar
 }
 
-// wtf why doesn't Rust have this built-in?
+// why doesn't Rust have this built-in?
 pub(crate) fn capitalized(s: &String) -> String {
     let ss = s.clone();
     ss.get(0..1).unwrap().to_uppercase() + ss.get(1..ss.len()).unwrap()

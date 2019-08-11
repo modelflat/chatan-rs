@@ -6,19 +6,22 @@ edition = "2018"
 
 [lib]
 name = "chatan"
-path = "src/chatan/lib.rs"
 
 [[bin]]
-name = "rolling_top_words"
-path = "src/jobs/rolling_top_words/main.rs"
+name = "rolling_top"
+path = "jobs/rolling_top/main.rs"
 
 [[bin]]
-name = "test"
-path = "src/jobs/test/main.rs"
+name = "top"
+path = "jobs/top/main.rs"
 
 [[bin]]
 name = "emote_index"
-path = "src/jobs/emote_index/main.rs"
+path = "jobs/emote_index/main.rs"
+
+[[bin]]
+name = "discover_emotes"
+path = "jobs/discover_emotes/main.rs"
 
 [dependencies]
 csv = "1.1"
@@ -31,6 +34,6 @@ chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 counter = "0.4"
-log = "0.4"
 image = "0.22"
 runtime-fmt = "0.3"
+structopt = "0.2"
