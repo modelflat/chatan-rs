@@ -11,7 +11,7 @@ use std::iter::Iterator;
 use std::fs::File;
 
 use rayon::prelude::*;
-use chrono::{Date, Utc, NaiveDate};
+use chrono::{Date, Utc, NaiveDate, Duration};
 use scraper::{Html, Selector};
 use reqwest::Client;
 use std::fmt::{Display, Formatter};
@@ -30,14 +30,16 @@ pub struct LogFileUrl {
 
 impl LogFileUrl {
 
-    pub fn from_overrustle_url(url: &str) -> LogFileUrl {
+    pub fn from_overrustle_url(url: &str) -> Result<LogFileUrl, chrono::format::ParseError> {
         let date_str = url.rsplitn(2, '/').next().unwrap();
-        let date = Date::<Utc>::from_utc(
-            NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                .expect("Overrustle url should end with parsable date, but it doesn't"),
-            Utc
-        );
-        LogFileUrl { url: format!("{}{}.txt", BASE_URL, url), path: None, date }
+        let parsing_result = NaiveDate::parse_from_str(date_str, "%Y-%m-%d");
+        match parsing_result {
+            Ok(date) => {
+                let date = Date::<Utc>::from_utc(date, Utc);
+                Ok(LogFileUrl { url: format!("{}{}.txt", BASE_URL, url), path: None, date })
+            },
+            Err(err) => Err(err)
+        }
     }
 
     pub fn from_local_path(channel: &String, path: PathBuf) -> Option<LogFileUrl> {
@@ -134,9 +136,6 @@ impl OverRustleLogs {
     pub fn make_and_sync(root_path: PathBuf, channel: String, mode: DataLoadMode) -> OverRustleLogs {
         let mut o = OverRustleLogs::new(root_path, channel, mode);
         o.sync().expect("Could not sync logs");
-        if o.range().is_none() {
-            panic!("Logs are empty after calling .sync()");
-        }
         o
     }
 
@@ -191,8 +190,33 @@ impl OverRustleLogs {
         self.index
             .par_iter_mut()
             .for_each(|l: &mut LogFileUrl| {
-                if l.path.is_none() && l.date < today {
+                // TODO 14 days should be parameterized
+                if l.path.is_none() || l.date >= today - Duration::days(2) {
                     let path = make_file_path(root_path, &l.date);
+
+                    // NOTE this doesn't work for overrustle as they don't send content-length
+                    // // check file sizes
+                    // if path.exists() {
+                    //     let local_size = std::fs::metadata(&path).expect("Cannot get metadata for file").len();
+                    //     match client.head(&l.url).send() {  
+                    //         Ok(resp) => {
+                    //             let remote_size = resp.content_length().unwrap_or(0);
+                    //             if local_size == remote_size {
+                    //                 // we don't need to download files if they are identical
+                    //                 bar.inc(1);
+                    //                 return;
+                    //             }
+                    //         }
+                    //         Err(err) => {
+                    //             // we silently discard path if unable to do HEAD against resource
+                    //             // TODO log error properly?
+                    //             eprintln!("ERR: cannot fetch metadata for remote file {:?}", err);
+                    //             bar.inc(1);
+                    //             return;
+                    //         }
+                    //     }
+                    // }
+                    // eprintln!("INF: downloading remote file {:?}", path);
                     if let Ok(mut res) = client.get(&l.url).send() {
                         let mut file = File::create(&path).expect("Unable to create local file");
                         std::io::copy(&mut res, &mut file).expect("Unable to write to local file");
@@ -303,7 +327,7 @@ fn get_text(client: &Client, url: &String) -> reqwest::Result<String> {
 
 fn select_urls(client: &Client, url: &String) -> Vec<String> {
     let selector = Selector::parse(".list-group-item").unwrap();
-    get_text(client, url)
+    let urls = get_text(client, url)
         .map(|text| {
             let document = Html::parse_document(text.as_str());
             let mut urls = Vec::new();
@@ -313,8 +337,14 @@ fn select_urls(client: &Client, url: &String) -> Vec<String> {
                     urls.push(s.value().attr("href").unwrap().to_string())
                 });
             urls
-        })
-        .expect(format!("Failed to load overrustle urls from {}", url).as_str())
+        });
+    match urls {
+        Ok(urls) => urls,
+        Err(err) => {
+            eprintln!("Failed to load overrustle urls from {}: {:?}", url, err);
+            Vec::new()
+        }
+    }
 }
 
 fn make_file_path(root_path: &PathBuf, date: &Date<Utc>) -> PathBuf {
@@ -337,10 +367,18 @@ fn get_all_urls_for_channel(client: &Client, channel: &String) -> Vec<LogFileUrl
             !s.ends_with("userlogs")
                 && !s.ends_with("broadcaster")
                 && !s.ends_with("subscribers")
+                && !s.ends_with("bans")
         })
-        .map(|s| {
+        .filter_map(|s| {
             bar.inc(1);
-            LogFileUrl::from_overrustle_url(&s)
+            let parsed_url = LogFileUrl::from_overrustle_url(&s);
+            match parsed_url {
+                Ok(url) => Some(url),
+                Err(err) => {
+                    eprintln!("Error parsing url ({}): {:?}", s, err);
+                    None
+                }
+            }
         })
         .collect();
     day_urls.sort_by(|l, r| l.date.cmp(&r.date));

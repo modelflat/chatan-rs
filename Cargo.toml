@@ -12,6 +12,10 @@ name = "rolling_top"
 path = "jobs/rolling_top/main.rs"
 
 [[bin]]
+name = "dump"
+path = "jobs/dump_logs/main.rs"
+
+[[bin]]
 name = "emote-index"
 path = "jobs/emote_index/main.rs"
 
@@ -20,12 +24,11 @@ csv = "1.1"
 indicatif = "0.11"
 rayon = "1.1"
 reqwest = "0.9"
-scraper = "0.4"
+scraper = "0.11"
 humantime = "1.2"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 counter = "0.4"
 image = "0.22"
-runtime-fmt = "0.3"
 structopt = "0.2"

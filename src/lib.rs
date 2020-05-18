@@ -2,7 +2,6 @@
 #![feature(drain_filter)]
 #![feature(fn_traits)]
 #![feature(unboxed_closures)]
-#![feature(result_map_or_else)]
 
 extern crate test;
 

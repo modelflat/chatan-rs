@@ -1,5 +1,3 @@
-#![feature(duration_float)]
-
 extern crate chatan;
 extern crate structopt;
 use structopt::StructOpt;
